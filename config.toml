@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Baltic Exchange TCE Scraper — configuration
+#
+# Run with:  baltic-scraper --config config.toml
+# ─────────────────────────────────────────────────────────────────────────────
+
+[scrape]
+# Which routes to scrape.
+#   "all"                       -> every route across every vessel class (default)
+#   ["TD02", "TD06", "TC05"]    -> only these route codes
+#
+# When a list is given, the scraper looks up each route's VesselClass in the
+# cached route map (src/baltic_scraper/route_map.py), groups routes by vessel
+# class, and selects each vessel class only once — so requesting 8 specific
+# routes never re-probes the other classes.
+routes = "all"
+
+# Output format: "json", "excel" or "both"
+format = "both"
+
+[output]
+# Leave empty for an auto-timestamped file under output/.
+json_path = ""
+excel_path = ""
+
+[browser]
+# Show the Chromium window while scraping.
+headed = false
+# Playwright element-wait timeout in milliseconds.
+timeout = 20000
+
+[logging]
+# Path to the execution log file. Leave empty to log to console only.
+# Each run appends a "New scraping session" banner.
+file = "logs/baltic_scraper.log"
