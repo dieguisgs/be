@@ -145,7 +145,23 @@ playwright install chromium
 
 ## Usage
 
-The command installs as `baltic-scraper` (or `python -m baltic_scraper.cli`).
+There are three equivalent ways to run it — they all accept the **same
+arguments**:
+
+```bash
+# 1) As an installed command
+baltic-scraper --format both
+
+# 2) As a Python module (no console-script needed)
+python -m baltic_scraper --format both
+
+# 3) As a plain Python app, straight from a checkout (no install required)
+python run.py --format both
+```
+
+`run.py` adds `src/` to the path itself, so it works even before
+`pip install`. Examples below use `baltic-scraper`, but any of the three forms
+works identically.
 
 ```bash
 # Everything: all 37 routes across all 9 vessel classes (JSON + Excel)
