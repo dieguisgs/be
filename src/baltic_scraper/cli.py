@@ -90,6 +90,7 @@ async def run(  # noqa: PLR0913
     capture_network: bool,
     verbose: bool,
     route_plan: dict[str, list[str]] | None = None,
+    channel: str | None = None,
 ) -> dict:
     """
     Main orchestration coroutine; drives Playwright and returns collected data.
@@ -124,6 +125,11 @@ async def run(  # noqa: PLR0913
         Targeted plan ``{vessel_class: [route_code, ...]}``.  When provided,
         discovery is skipped and only these vessel classes / routes are
         scraped (the efficient path for "just these N routes").
+    channel : str, optional
+        Browser channel for the Chromium engine: ``None`` (default) uses
+        Playwright's bundled Chromium; ``"chrome"`` / ``"msedge"`` use the
+        system-installed Google Chrome / Microsoft Edge instead (no Chromium
+        download needed).
 
     Returns
     -------
@@ -134,8 +140,12 @@ async def run(  # noqa: PLR0913
     OUTPUT_DIR.mkdir(exist_ok=True)
     result: dict = {}
 
+    launch_kwargs: dict = {"headless": not headed}
+    if channel:
+        launch_kwargs["channel"] = channel
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not headed)
+        browser = await pw.chromium.launch(**launch_kwargs)
         page = await browser.new_page()
 
         try:
@@ -454,7 +464,13 @@ Examples
     )
     p.add_argument(
         "--headed", action="store_true",
-        help="Run Chromium in visible (headed) mode",
+        help="Run the browser in visible (headed) mode",
+    )
+    p.add_argument(
+        "--channel", choices=["chromium", "chrome", "msedge"], default=None,
+        help="Browser to drive (default 'msedge' = system Microsoft Edge, no "
+             "Chromium download needed). Use 'chromium' for Playwright's "
+             "bundled browser, or 'chrome' for system Google Chrome.",
     )
     p.add_argument(
         "--timeout", type=int, default=DEFAULT_TIMEOUT, metavar="MS",
@@ -562,6 +578,13 @@ def main(argv: list[str] | None = None) -> int:
             args.output_excel = str(cfg.excel_path)
         if log_file is None and cfg.log_file:
             log_file = cfg.log_file
+        if args.channel is None and cfg.channel:
+            args.channel = cfg.channel
+
+    # Resolve the effective browser: CLI flag > config > default ("msedge").
+    # "chromium" means the bundled engine -> pass None (no channel).
+    effective_channel = args.channel or "msedge"
+    channel = None if effective_channel == "chromium" else effective_channel
 
     # Configure logging (console unless --quiet; file when a path is set).
     setup_logging(log_file=log_file, verbose=not args.quiet)
@@ -591,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:
             capture_network=args.capture_network,
             verbose=not args.quiet,
             route_plan=route_plan,
+            channel=channel,
         )
     )
 

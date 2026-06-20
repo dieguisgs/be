@@ -24,10 +24,14 @@ json_path = ""
 excel_path = ""
 
 [browser]
-# Show the Chromium window while scraping.
+# Show the browser window while scraping.
 headed = false
 # Playwright element-wait timeout in milliseconds.
 timeout = 20000
+# Browser to drive. Default is "msedge" (system Microsoft Edge — no Chromium
+# download needed). Use "chromium" for Playwright's bundled browser, or
+# "chrome" for system Google Chrome. Leave empty to use the default (msedge).
+channel = "msedge"
 
 [logging]
 # Path to the execution log file. Leave empty to log to console only.

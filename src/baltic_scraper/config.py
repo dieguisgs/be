@@ -37,6 +37,9 @@ class ScrapeConfig:
         Playwright element-wait timeout in milliseconds.
     log_file : Path or None
         Where to write the execution log; ``None`` disables file logging.
+    channel : str or None
+        Browser channel: ``None`` uses bundled Chromium; ``"chrome"`` /
+        ``"msedge"`` drive the system-installed browser.
     """
 
     routes: str | list[str] = "all"
@@ -46,6 +49,7 @@ class ScrapeConfig:
     headed: bool = False
     timeout: int = 20_000
     log_file: Path | None = None
+    channel: str | None = None
 
     def is_all(self) -> bool:
         """
@@ -130,4 +134,5 @@ def load_config(path: Path) -> ScrapeConfig:
         headed=bool(browser.get("headed", False)),
         timeout=int(browser.get("timeout", 20_000)),
         log_file=_opt_path(logging_cfg.get("file", "")),
+        channel=(browser.get("channel", "") or "").strip() or None,
     )

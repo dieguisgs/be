@@ -129,17 +129,44 @@ scraper can jump straight to the right class when specific routes are requested:
 
 **Requirements:** Python ≥ 3.11. [uv](https://docs.astral.sh/uv/) recommended.
 
-```bash
-# With uv (recommended)
-uv pip install --system -e ".[dev]"
-playwright install chromium
+Installation has **two parts** — this trips people up: the Python library alone
+is not enough, Playwright also needs an actual browser to drive.
 
-# or with pip
-pip install -e ".[dev]"
-playwright install chromium
+By default the scraper drives **Microsoft Edge** (`--channel msedge`), which is
+pre-installed on every Windows machine, so there is **nothing extra to
+download** — you only install the Python library:
+
+```bash
+# Just the Python library + dependencies (Edge is used by default)
+uv pip install --system -e ".[dev]"     # or: pip install -e ".[dev]"
 ```
 
-`playwright install chromium` downloads the browser binary (one-time).
+Prefer Playwright's bundled Chromium instead? Download it once and pass
+`--channel chromium`:
+
+```bash
+playwright install chromium              # one-time, ~150 MB
+baltic-scraper --channel chromium --format both
+```
+
+### Do I need to "install Playwright" on the machine?
+
+- **The Python library** (`playwright`) is a normal pip/uv dependency — it
+  installs into your Python environment, like any other package. It is **not** a
+  system-wide program. This is the only thing you must install.
+- **The browser**: by **default the scraper uses your system Microsoft Edge**
+  (`msedge`), so no browser download is needed. Alternatively you can:
+  - download Playwright's self-contained Chromium with `playwright install
+    chromium` (lands in a cache folder, e.g. `%LOCALAPPDATA%\ms-playwright` on
+    Windows — **not** a system install) and run with `--channel chromium`, or
+  - use system Chrome with `--channel chrome`.
+
+So on a typical Windows machine you can run **right after installing the Python
+library**, with no extra download:
+
+```bash
+baltic-scraper --format both        # uses Edge by default
+```
 
 ---
 
@@ -200,7 +227,8 @@ baltic-scraper --debug --capture-network --headed -vc VLCC -r TD02
 | `--output-excel FILE`, `-oe` | Excel path (default: auto-timestamped) |
 | `--log-file FILE` | Write the execution log to a file |
 | `--list` | List classes and routes only; do not scrape |
-| `--headed` | Show the Chromium window |
+| `--headed` | Show the browser window |
+| `--channel {chromium,chrome,msedge}` | Which browser to drive. **Default `msedge`** (system Edge, no download). Use `chromium` for Playwright's bundled browser, or `chrome` for system Chrome |
 | `--timeout MS` | Element-wait timeout (default 20000) |
 | `--debug` | Save HTML/PNG snapshots to `output/` |
 | `--capture-network` | Log XHR/fetch/WebSocket to `output/api_calls.json` |
@@ -220,6 +248,7 @@ excel_path = ""
 [browser]
 headed = false
 timeout = 20000
+channel = "msedge"        # default: system Edge. "chromium" = bundled; "chrome" = system Chrome
 
 [logging]
 file = "logs/baltic_scraper.log"   # empty = console only
