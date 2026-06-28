@@ -1,409 +1,356 @@
-# Baltic Exchange TCE Scraper
+# Gas Tenor & VWAP Engine
 
-A **Playwright**-based scraper for
-**https://emissions.research.balticexchange.com/earnings/tce**.
+> ✅ **OFFICIAL / canonical location of the engine code.** Work here.
+> (A copy of these `.py` files also exists in the parent `GAS/` folder as the
+> "integrated-with-pre-production" snapshot; it is left in place but is **not**
+> the source of truth.)
 
-For every **VesselClass** and every **TD/TC route**, it extracts all data
-sections on the page (Income, Canals, Ports, Navigation Consumption, …) with
-their **Name | Your Outcome | Baltic Outcome | Difference** columns, and exports
-them to **JSON** (nested dictionary) and/or **Excel** (one sheet per route).
 
----
+Post-production toolkit that turns a flat book of gas trades into **tenor-tagged
+VWAP curves**. It is split into small, single-responsibility classes — one
+produces the result the next consumes — so tenor logic, Outright pricing and
+Spread pricing never get tangled.
 
-## Context: what is this?
-
-The [Baltic Exchange](https://www.balticexchange.com/) is the world's reference
-body for maritime freight pricing. Its **TCE Earnings** (Time Charter
-Equivalent) tool compares the economic performance of *your vessel* against the
-Baltic's *benchmark vessel* on a given route.
-
-- **TCE (Time Charter Equivalent):** the daily-equivalent income ($/day) of a
-  voyage — the standard metric for comparing spot voyages.
-- **VesselClass:** vessel type (VLCC, Suezmax, Aframax, …). Each class exposes a
-  different set of available routes.
-- **TD / TC routes:** Baltic route codes. `TD*` = *Dirty* (crude / fuel oil),
-  `TC*` = *Clean* (refined products).
-- **Your Outcome vs Baltic Outcome vs Difference:** your result, the benchmark's
-  result, and the difference, for every line item (income, canals, ports,
-  navigation consumption, emissions, …).
-
-The site is built with [Anvil](https://anvil.works/) (a Python framework that
-renders a SPA over WebSockets). **There is no public REST API** and the content
-is generated dynamically in the browser, so a static HTTP scraper does not work:
-**a headless browser (Playwright) is mandatory**.
+> This folder is a **self-contained copy** of the post-production engines, kept
+> apart from the pre-production pipeline (`gas_production_processor.py`,
+> `tools_gas.py`, the production notebook) on purpose. For the full
+> Data-Engineering PRD (classification rules, acceptance criteria, decisions),
+> see the top-level `README.md`.
 
 ---
 
-## Data freshness & reliability
+## 1. Architecture
 
-The Baltic Exchange publishes its route assessments **once per UK business day**
-(Monday–Friday, excluding London public holidays). Each morning a panel of
-shipbrokers submits assessments, and the Baltic publishes the consolidated
-figures later the same day (typically in the **afternoon, London/UK time**).
+```
+raw trades
+  │
+  │  ┌── GasTenorProcessor  (tenor generation) ─────────────────────────────┐
+  ├─►│ clean → classify periodicity → compute tenor1 / tenor2               │
+  │  │ run() → enriched df_trades (+ periodicity_2, tenor, tenor2)          │
+  │  └─────────────────────────────────────────────────────────────────────┘
+  │            │
+  │            ├──►  GasOutrightEngine    (Outright VWAP, on demand)
+  │            └──►  GasSpreadEngine  (Spread VWAP, independent)
+```
 
-- **Update cadence:** **daily on business days** — not intraday, not monthly.
-  Numbers do **not** change over the weekend or on UK holidays.
-- **This tool:** the TCE calculator recomputes its output from the **latest
-  daily Baltic assessment**, so re-running the scraper on the same day generally
-  yields the same numbers; new figures appear the next business day.
-- **No on-page timestamp:** the page does **not** display an explicit
-  "last updated" date, so the scraper does not capture one. Treat the data as
-  *"the most recent business-day assessment at the time of scraping"*. For an
-  auditable history, run the scraper on a daily schedule (the output filename is
-  timestamped, e.g. `baltic_tce_YYYYMMDD_HHMMSS.json`).
-- **Reliability:** values come straight from the Baltic's official tool — they
-  are as authoritative as the Baltic's published assessments. The scraper reads
-  the rendered figures verbatim (as strings, e.g. `"$46,997.73"`), so no
-  rounding or transformation is introduced.
+| File | Class | Responsibility |
+|---|---|---|
+| `periodicity_tenor_generation.py` | **`GasTenorProcessor`** | Enrich trades with the corrected periodicity (`periodicity_2`) and the two tenors (`tenor`=tenor1, `tenor2`). `run()` returns the enriched trades. Detailed docs: **[`README_TENOR.md`](./README_TENOR.md)**. *(`GasEMEAProcessor` kept as an alias.)* |
+| `outright_vwap_engine.py` | **`GasOutrightEngine`** | **Outright** VWAP. Consumes the enriched trades; groups by `tenor1`/`tenor2`, by selected **instrument** (Future/Spot Fwd/Option, combinable), GAS/LNG split by `DEAL_TYPE`. |
+| `spread_vwap_engine.py` | **`GasSpreadEngine`** | **Spread** VWAP (independent). Resolves the differential and VWAPs it. |
+| `periodicity_2_processor.py` | `Periodicity2Processor` | Audit tool: recomputes `PERIODICITY_2` from dates and lists rows where it disagrees with the production `PERIODICITY`. |
 
-> **Recommended schedule:** run once per business day, after the daily
-> publication (late afternoon UK time) to capture that day's assessment.
+The three engines only need `pandas` / `numpy` and do **not** import each other —
+they communicate through the enriched DataFrame.
+
+**Region is implicit.** EMEA, APAC and AMERICAS share the same gas column structure,
+so the engines are region-agnostic — run them once per regional dataset. The product
+name (`CLASSIFICATION_1`) and the region split are built **upstream** in pre-production;
+here you only pass the matching `seasonal_type` (ROW for EMEA/APAC, US for AMERICAS).
 
 ---
 
-## Data dictionary — what each field means
+## 2. Input data — gas trade structure
 
-Every route returns the same **12 sections**. Each section is a table whose rows
-are line items, and whose three value columns are:
+Every engine consumes a **flat, per-trade table** (one row per trade leg; rows can
+be **duplicated per `DEAL_ID`**). EMEA, APAC and AMERICAS share this same column
+layout — that is why the engines are region-agnostic. The columns, grouped by role:
+
+**Identity & timing**
 
 | Column | Meaning |
 |---|---|
-| **Your Outcome** | Result computed for *your* configured vessel (Settings). |
-| **Baltic Outcome** | Result for the Baltic's standard **benchmark** vessel. |
-| **Difference** | `Your Outcome − Baltic Outcome` (per line item). |
+| `DEAL_ID` | Unique deal id. Rows are duplicated per `DEAL_ID` → **dedupe before summing**. |
+| `DEAL_EXECUTION_DATETIME` | Trade timestamp → the **reference date** (and the hours window). |
+| `IS_DELETED` | Soft-delete flag; `TRUE` rows are dropped. |
 
-### Sections
+**Price & volume (the VWAP inputs)**
 
-| Section | What it covers |
+| Column | Meaning |
 |---|---|
-| **Time Charter Equivalent (TCE) Outcome** | Headline result: the voyage's TCE in `$/day`. |
-| **Income** | Revenue side: TCE `$/day`, total voyage days, freight/earnings components. |
-| **Expenses** | Total and additional voyage expenses (`$`). |
-| **Emissions** | Regulatory carbon costs: **FuelEU** (FuelEU Maritime penalty) and **ETS** (EU Emissions Trading System cost). |
-| **Canals** | Canal dues — **Suez Canal Dues** and **Non-Suez Canal Dues** (`$`). |
-| **Ports** | **Load Port Charges** and **Discharge Port Charges** (`$`). |
-| **Navigation Consumption** | Fuel cost while sailing, split **ECA** vs **Non-ECA** (Emission Control Areas), plus per-tonne fuel prices (`$/tn`). |
-| **Navigation Days** | Days at sea, split ballast/laden and ECA/Non-ECA. |
-| **Idle Consumption** | Fuel use & rates while idle/waiting. |
-| **Loading Consumption** | Fuel use & rates during cargo loading. |
-| **Discharging Consumption** | Fuel use & rates during cargo discharge. |
-| **Heating Consumption** | Fuel use & rates for cargo heating. |
+| `DEAL_PRICE` | Trade price. For options = the **premium**; for a booked spread (form A) = the **differential**. |
+| `QUANTITY` | Trade volume — the **VWAP weight**. |
+| `QUANTITY_UNIT` / `PRICE_UNIT` / `QUANTITY_FREQ` | Units; must match across the legs of a spread chain before they can be combined. |
 
-### Common terms in row names
+**What is traded (classification)**
 
-| Term | Meaning |
+| Column | Meaning |
 |---|---|
-| **Ballast** | Sailing empty (no cargo) toward the load port. |
-| **Laden** | Sailing loaded with cargo. |
-| **ECA / Non-ECA** | Emission Control Area (stricter, low-sulphur fuel) vs outside it. |
-| **VLSFOeq** | Very Low Sulphur Fuel Oil equivalent — fuel normalised to a common basis. |
-| **$/day** | Time-charter-equivalent daily rate. |
-| **$/tn** | Price per tonne of fuel. |
-| **GRT** | Gross Registered Tonnage (vessel size measure). |
+| `CLASSIFICATION_1` | The gas **product** (NBP, TTF, PSV, THE, …) → the product label. |
+| `CLASSIFICATION_2` | Second product; when present it marks a **booked spread** (form A). |
+| `DEAL_TYPE` | **GAS vs LNG** — the only thing that splits the two; kept in separate rows by default. |
+| `TRANSACTION_TYPE_ISDA` | **Instrument**: `Future`, `Spot Fwd` or `Option` (selectable & combinable). |
+| `STRATEGY` | `Outright` vs `Spread` → routes the trade to the Outright or Spread engine. |
+| `CONTRACT_START_DATE` / `CONTRACT_END_DATE` | Delivery period → the periodicity & tenor (Stage 1). |
+| `PERIODICITY` / `TERM_DESCRIPTION` | Periodicity hint; raw term used for `tenor2`. |
 
----
+**Options**
 
-## The route map (37 routes, 9 vessel classes)
-
-Each route only appears under its VesselClass. This mapping is cached in
-[`src/baltic_scraper/route_map.py`](src/baltic_scraper/route_map.py) so the
-scraper can jump straight to the right class when specific routes are requested:
-
-| VesselClass | Type | Routes |
-|---|---|---|
-| VLCC | Dirty | TD02, TD03, TD15, TD22 |
-| Suezmax | Dirty | TD06, TD20, TD23, TD27 |
-| Aframax | Dirty | TD07, TD08, TD09, TD14, TD19, TD25, TD26 |
-| LR2 | Clean | TC15, TC01, TC20 |
-| Panamax | Dirty | TD12, TD21 |
-| LR1 | Clean | TC05, TC08, TC16 |
-| MR | Clean | TC02, TC07, TC10, TC11, TC12, TC14, TC17, TC18, TC19, TC21, TC22 |
-| Handysize | Dirty | TD18 |
-| Handysize | Clean | TC06, TC23 |
-
-> To regenerate the map if the site changes: `baltic-scraper --list`.
-
----
-
-## Installation
-
-**Requirements:** Python ≥ 3.11. [uv](https://docs.astral.sh/uv/) recommended.
-
-Installation has **two parts** — this trips people up: the Python library alone
-is not enough, Playwright also needs an actual browser to drive.
-
-By default the scraper drives **Microsoft Edge** (`--channel msedge`), which is
-pre-installed on every Windows machine, so there is **nothing extra to
-download** — you only install the Python library:
-
-```bash
-# Just the Python library + dependencies (Edge is used by default)
-uv pip install --system -e ".[dev]"     # or: pip install -e ".[dev]"
-```
-
-Prefer Playwright's bundled Chromium instead? Download it once and pass
-`--channel chromium`:
-
-```bash
-playwright install chromium              # one-time, ~150 MB
-baltic-scraper --channel chromium --format both
-```
-
-### Do I need to "install Playwright" on the machine?
-
-- **The Python library** (`playwright`) is a normal pip/uv dependency — it
-  installs into your Python environment, like any other package. It is **not** a
-  system-wide program. This is the only thing you must install.
-- **The browser**: by **default the scraper uses your system Microsoft Edge**
-  (`msedge`), so no browser download is needed. Alternatively you can:
-  - download Playwright's self-contained Chromium with `playwright install
-    chromium` (lands in a cache folder, e.g. `%LOCALAPPDATA%\ms-playwright` on
-    Windows — **not** a system install) and run with `--channel chromium`, or
-  - use system Chrome with `--channel chrome`.
-
-So on a typical Windows machine you can run **right after installing the Python
-library**, with no extra download:
-
-```bash
-baltic-scraper --format both        # uses Edge by default
-```
-
----
-
-## Usage
-
-There are three equivalent ways to run it — they all accept the **same
-arguments**:
-
-```bash
-# 1) As an installed command
-baltic-scraper --format both
-
-# 2) As a Python module (no console-script needed)
-python -m baltic_scraper --format both
-
-# 3) As a plain Python app, straight from a checkout (no install required)
-python run.py --format both
-```
-
-`run.py` adds `src/` to the path itself, so it works even before
-`pip install`. Examples below use `baltic-scraper`, but any of the three forms
-works identically.
-
-```bash
-# Everything: all 37 routes across all 9 vessel classes (JSON + Excel)
-baltic-scraper --format both
-
-# Specific routes only (jumps straight to each route's vessel class)
-baltic-scraper --routes "TD02,TD06,TC05"
-
-# Via a config file
-baltic-scraper --config config.toml
-
-# Substring filters (discovery mode)
-baltic-scraper --vessel-class VLCC          # VLCC class only
-baltic-scraper --route TD02                 # routes containing "TD02"
-
-# List available classes and routes (no data scraping)
-baltic-scraper --list
-
-# Watch the browser + log to a file
-baltic-scraper --routes TD02 --headed --log-file logs/run.log
-
-# Debug selectors: save HTML/PNG snapshots and network requests
-baltic-scraper --debug --capture-network --headed -vc VLCC -r TD02
-```
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `--config FILE`, `-c` | TOML config file (see `config.toml`) |
-| `--routes CODES` | Comma-separated route codes (`TD02,TC05`). Uses the route map to jump straight to each vessel class |
-| `--vessel-class FILTER`, `-vc` | Substring filter for vessel class |
-| `--route FILTER`, `-r` | Substring filter for route name |
-| `--format {json,excel,both}` | Output format (default `json`) |
-| `--output FILE`, `-o` | JSON path (default: auto-timestamped) |
-| `--output-excel FILE`, `-oe` | Excel path (default: auto-timestamped) |
-| `--log-file FILE` | Write the execution log to a file |
-| `--list` | List classes and routes only; do not scrape |
-| `--headed` | Show the browser window |
-| `--channel {chromium,chrome,msedge}` | Which browser to drive. **Default `msedge`** (system Edge, no download). Use `chromium` for Playwright's bundled browser, or `chrome` for system Chrome |
-| `--timeout MS` | Element-wait timeout (default 20000) |
-| `--debug` | Save HTML/PNG snapshots to `output/` |
-| `--capture-network` | Log XHR/fetch/WebSocket to `output/api_calls.json` |
-| `--quiet`, `-q` | Silence the console (file logging still happens) |
-
-### Configuration file (`config.toml`)
-
-```toml
-[scrape]
-routes = "all"            # "all" or ["TD02", "TC05", ...]
-format = "both"           # "json" | "excel" | "both"
-
-[output]
-json_path = ""            # empty = auto-timestamped name
-excel_path = ""
-
-[browser]
-headed = false
-timeout = 20000
-channel = "msedge"        # default: system Edge. "chromium" = bundled; "chrome" = system Chrome
-
-[logging]
-file = "logs/baltic_scraper.log"   # empty = console only
-```
-
-CLI flags take priority over the config file.
-
----
-
-## Performance — how long does it take?
-
-Measured on a full run of all 37 routes:
-
-| Metric | Time |
+| Column | Meaning |
 |---|---|
-| **Full run (37 routes)** | **~3.8 min (~229 s)** |
-| **Per route** (select + extract) | **~4 s** (median; 3–13 s) |
-| **Per vessel-class switch** | **~9 s** (Settings → select → OK → refresh) |
+| `OPTION_TYPE`, `STRIKE_PRICE_PER_UNIT`, `OPTION_EXPIRY`, `OPTION_STYLE` | The exact option contract; a premium is only comparable within one such contract. |
 
-Rough formula: `total ≈ 9 × (class switch) + N × (4 s per route)`.
-A single targeted route (`--routes TD02`) takes ~20 s (initial load ~10 s +
-class switch ~9 s + route ~4 s).
+**Spreads (form B — two legs)**
 
-The time is dominated by **fixed waits** that let Anvil's async grids render, not
-by the browser itself.
-
----
-
-## Architecture & logic
-
-`src/baltic_scraper/` package (src-layout, installable):
-
-```
-src/baltic_scraper/
-├── cli.py            # CLI + orchestration (discovery mode / targeted mode)
-├── scraper.py        # Playwright interaction layer + extraction (injected JS)
-├── route_map.py      # Cached route -> vessel class map (+ grouping)
-├── config.py         # TOML loader -> ScrapeConfig (BOM-tolerant)
-├── output.py         # JSON and Excel serializers
-└── logging_setup.py  # Console and/or file logger
-```
-
-### Two scraping modes
-
-1. **Targeted mode** (`--routes` / config with a list) — the efficient path.
-   `route_map.group_routes_by_vessel_class()` groups the requested codes by
-   their VesselClass, so each class is selected **once** and only its requested
-   routes are scraped. Requesting 8 routes never walks all 9 classes.
-
-2. **Discovery mode** (`--list`, `--vessel-class`, or no filters) — opens
-   Settings, reads all VesselClasses, and discovers each one's routes live.
-   Useful for regenerating the map or sweeping everything.
-
-### How the site is driven (the non-obvious bits)
-
-The site is Anvil (Material-3). Learned by DOM inspection:
-
-- The class selector lives in an `#alert-modal` modal (the **Settings** button).
-- The dropdown is `.anvil-m3-dropdownMenu-container` (text "Vessel Class"), not a
-  `<select>`. Its options are `.anvil-m3-menuItem-labelText`.
-- **Selecting an option requires a coordinate click** (`mouse.click` on the
-  centre of the bounding box); a normal `locator.click` does not trigger Anvil's
-  handler.
-- You must click **OK** to apply and return to the main screen; the route radios
-  then refresh **asynchronously**.
-- Routes are `input[type=radio]`, filtered with the pattern `T[DC]\d+:` to
-  discard other radios ("$/tn", "TCE", "Lump Sum", …).
-- Each section is an `.anvil-data-grid`. Extraction (injected JS, `_EXTRACT_JS`)
-  walks the grids, reads the `.anvil-data-row-panel`/`.anvil-data-row-col` rows,
-  and associates each grid with the section title (`span.anvil-label-text`
-  outside any grid) that precedes it in document order.
-
-### Resilience ("get the data no matter what")
-
-- **Retries in `select_route`:** after a class switch the routes take time to
-  refresh; it polls up to 6 times before giving up.
-- **Resilient extraction:** `extract_sections_resilient` retries when it gets 0
-  sections (grids render late).
-- **Error isolation:** each vessel class and each route runs in its own
-  `try/except`; a failure is logged and skipped, never aborting the run.
-- **Guaranteed save:** a `try/finally` persists whatever was collected **even if
-  the run fails midway**.
-- **UTF-8 / BOM:** console output forced to UTF-8 (Windows) and config loading is
-  BOM-tolerant.
-
----
-
-## Output format
-
-### JSON (nested dictionary)
-
-```json
-{
-  "VLCC (Dirty Tanker)": {
-    "TD02: Ras Tanura to Singapore": {
-      "Time Charter Equivalent (TCE) Outcome": {
-        "Time Charter Equivalent ($/day)": {
-          "your_outcome": "$46,997.73",
-          "baltic_outcome": "$46,997.73",
-          "difference": "$0.00"
-        }
-      },
-      "Income": { "Total Voyage Days": { "your_outcome": "34.706", "...": "..." } },
-      "Canals": { "...": {} },
-      "Ports": { "...": {} },
-      "Navigation Consumption": { "...": {} }
-    }
-  }
-}
-```
-
-### Excel
-
-**One sheet per route** (`TD02`, `TD06`, …). Inside: a header with the route
-name and the vessel class, then per section a styled
-**Name | Your Outcome | Baltic Outcome | Difference** table.
-
----
-
-## Development, lint & tests
-
-```bash
-ruff check .                 # linter (config in pyproject.toml)
-ruff check --fix .           # autofix
-
-pytest                       # tests (with coverage, fail_under = 80%)
-pytest --cov-report=html     # HTML report in htmlcov/
-```
-
-- **Coverage:** > 85% (minimum 80%, configured in `pyproject.toml`).
-- Tests use async Playwright *fakes* (`tests/conftest.py`), no real browser, so
-  they run in ~2 s.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause / fix |
+| Column | Meaning |
 |---|---|
-| `No vessel classes detected` | The Anvil app failed to load. Run with `--headed` to watch the browser. |
-| A route returns 0 sections | Grids did not render in time. Raise `--timeout 40000`; automatic retries already help. |
-| `Route 'X' not found` | The code does not exist or the site changed its mapping. Check with `--list`. |
-| `TOMLDecodeError` | The config has invalid TOML (BOM is already tolerated). Check the syntax. |
-| `playwright ... executable doesn't exist` | Browser binary missing: `playwright install chromium`. |
-| Broken selectors after a site redesign | Run `--debug --headed` (saves HTML/PNG to `output/`) and inspect; the extraction JS is in `_EXTRACT_JS` (`scraper.py`). |
+| `EXECUTION_CHAIN_ID` | Links the two legs of an unbooked spread. |
+| `BUYER_GCD_ID` / `SELLER_GCD_ID` | Counterparty codes; the firm is buyer on one leg, seller on the other (swapped) → used to **pair** the legs. |
 
 ---
 
-## Note on "less intrusive" scraping
+## 3. Stage 1 — tenor generation (`GasTenorProcessor`)
 
-The site uses Anvil's proprietary WebSockets; **no public REST API** returning
-this data was found. A real browser is therefore the only reliable route. To
-minimise footprint:
+The first stage enriches every trade with `periodicity_2`, `tenor` (= `tenor1`)
+and `tenor2`, derived from the contract dates. Its full logic — the mapping
+matrix, the BOM/BOW balance buckets and the configurable tolerances — has its own
+document: **[`README_TENOR.md`](./README_TENOR.md)**.
 
-- It runs **headless** by default (no window).
-- **Targeted mode** (`--routes`) visits only what is needed.
-- `--capture-network` lets you inspect whether a usable HTTP endpoint ever
-  appears in the future.
+In short, `run()` adds three columns the engines then group by:
+
+- **`periodicity_2`** — date-derived bucket (Daily, Weekend, Weekly, Monthly,
+  Quarterly, Seasonal, Annual, or the balance refinements BOM / BOW).
+- **`tenor`** (= `tenor1`) — the canonical market tenor (`Custom` merges the odd
+  periods).
+- **`tenor2`** — same, but `Custom` → raw `TERM_DESCRIPTION` (odd periods stay
+  distinguishable).
+
+The engines then let you VWAP **by `tenor1` or `tenor2`** on demand.
+
+---
+
+## 4. Stage 2a — Outright VWAP (`GasOutrightEngine`)
+
+Consumes the enriched trades and computes VWAPs **on demand**. Only **Outright**
+trades are aggregated (Spreads go to §5); the product label is always
+`CLASSIFICATION_1`.
+
+**Flow**
+
+```
+enriched trades
+  → _select  : keep Outright, apply instrument + deal_type filters
+  → _apply_vwap_filters : drop deals outside the hours/weekdays window (if any)
+  → group by [reference_date, (deal_type), product, periodicity_2, tenor]
+  → VWAP = Σ(price·qty) / Σ(qty)
+```
+
+**Methods (what you can compute)**
+
+| Method | Computes | Price | Extra grouping |
+|---|---|---|---|
+| `vwap()` | **linear** Outright (Future / Spot Fwd) | `DEAL_PRICE` | — |
+| `vwap_options()` | Outright **options** | premium (`DEAL_PRICE`) | option_type, strike, expiry, style |
+| `pivot_wide()` | `vwap()` pivoted, products side by side | — | — |
+
+`vwap_options()` is separate so option **premiums are never pooled with forward
+prices**; a premium only makes sense within one exact contract, hence the extra
+keys.
+
+**Calculation options** (per call unless noted)
+
+| Option | Where | Default | Effect |
+|---|---|---|---|
+| `by` | `vwap` / `vwap_options` | `"tenor1"` | **tenor1** (every `Custom` merged) vs **tenor2** (`Custom` split by `TERM_DESCRIPTION`). |
+| `instruments` | `vwap` (+ `vwap_options`) | `None` = all | Which `TRANSACTION_TYPE_ISDA`. **Combinable**: `["Future","Spot Fwd"]` pools both, one isolates it. ⚠️ Don't pool an **Option** with linear instruments (premium vs forward price). |
+| `deal_types` | `vwap` / `vwap_options` | `None` = all | Restrict to a subset of `DEAL_TYPE` (e.g. `["GAS"]`). |
+| `combine_deal_types` | `vwap` / `vwap_options` | `False` | `False` → **GAS and LNG in separate rows**. `True` → **pool both** into one VWAP (drops the `deal_type` column). ⚠️ Different commodities / curves — mixing two price series. The product **name** is `CLASSIFICATION_1` either way; GAS/LNG lives only in the `deal_type` column, never in the name. |
+| `vwap_filters` | **constructor** | `{}` = all deals | Per-granularity **computation window**: a dict keyed by tenor/bucket → `{"hours": ("08:00","17:00"), "weekdays": ["Mon",…]}`. Restricts *which deals are counted* for that granularity (e.g. "only count Daily deals from 08:00 to 17:00"); buckets not listed keep all deals. |
+
+**Future and Spot Fwd: separate or together.** Because `instruments` is
+combinable you choose explicitly:
+
+```python
+eng.vwap("tenor1", instruments=["Future"])                 # Future only
+eng.vwap("tenor1", instruments=["Spot Fwd"])               # Spot Fwd only
+eng.vwap("tenor1", instruments=["Future", "Spot Fwd"])     # both pooled in one VWAP
+eng.vwap("tenor1")                                          # None = every instrument
+```
+
+The same applies to GAS/LNG (`combine_deal_types`) and to the tenor (`by`) — each
+selection is independent, so any combination is valid.
+
+Output: `reference_date, weekday, [deal_type], product, periodicity_2,
+<tenor1|tenor2>, vwap, total_volume, trade_count` (the `deal_type` column is
+omitted when `combine_deal_types=True`; option output adds the four option keys).
+
+---
+
+## 5. Stage 2b — Spread VWAP (`GasSpreadEngine`, independent)
+
+A spread price is a **differential** (can be negative), so it must never be pooled
+into an Outright VWAP.
+
+**Flow**
+
+```
+enriched trades
+  → _select  : drop IS_DELETED, keep Spread, apply instrument + deal_type filters
+  → _dedupe  : one row per DEAL_ID (rows are duplicated)
+  → build_spreads : resolve each spread to one priced row (form A + form B)
+  → group by [reference_date, deal_type, product, periodicity_2, tenor_near, tenor_far]
+  → VWAP = Σ(spread_price·volume) / Σ(volume)
+```
+
+A spread is keyed by **both leg tenors** (`tenor_near`, `tenor_far`) — see §6.1.
+For a time spread they differ (e.g. `M+1` / `M+2`); for a location spread they are
+equal (one delivery period). This is what stops `M+1/M+2` and `Q4/Q1` from
+collapsing onto the same row.
+
+**Methods (what you can compute)**
+
+| Method | Computes |
+|---|---|
+| `build_spreads()` | Resolve every spread to one priced row (no VWAP yet); unusable chains go to `self._unresolved`. |
+| `vwap()` | VWAP of **linear** spreads (Future / Spot Fwd). |
+| `vwap_options()` | VWAP of **option** spreads (premium differential; multi-leg cases left unresolved for now). |
+
+**Calculation options**
+
+| Option | Where | Default | Effect |
+|---|---|---|---|
+| `by` | `vwap` / `vwap_options` | `"tenor1"` | tenor1 vs tenor2 (same meaning as Outright). |
+| `instruments` | `vwap` (`("Future","Spot Fwd")`) / `vwap_options` (`("Option",)`) / `build_spreads` (`None`) | per method | Which `TRANSACTION_TYPE_ISDA`; combinable, same as Outright. |
+| `deal_types` | all three | `None` = all | Restrict `DEAL_TYPE` (GAS/LNG). |
+| `own_gcd` | **constructor** | `None` | The firm's GCD code(s). With the fixed `near − far` convention the sign no longer needs it, so it is now only an **optional pairing sanity-check** (firm is buyer on one leg, seller on the other). |
+| `contract_start_col` | **constructor** | `"CONTRACT_START_DATE"` | Delivery-start column used to order the near/far legs of a time spread. |
+
+> GAS and LNG are **always** kept in separate rows here (no `combine_deal_types`
+> yet — say the word and I mirror the Outright option).
+
+**Two forms of a spread:**
+
+- **Form A** — `CLASSIFICATION_2` has a value → `DEAL_PRICE` is already the
+  differential. Product = `"Spread C1_C2"`.
+- **Form B** — `CLASSIFICATION_2` is null → two legs share an
+  `EXECUTION_CHAIN_ID` (both `STRATEGY=Spread`, one buy + one sell). The
+  differential uses a **fixed convention**, not the firm's buy/sell side — see
+  §6.2: `price(near) − price(far)` for a time spread, fixed product order for a
+  location spread. Both leg prices are in the data, so the value is computed
+  directly; `BUYER_GCD_ID` / `SELLER_GCD_ID` only confirm the leg pairing.
+  Product = `"Spread C1near_C1far"` (location) or `"Spread C1"` + a `(near, far)`
+  tenor pair (time, see §6.1).
+
+Mandatory data hygiene: **(1)** dedupe by `DEAL_ID` (rows are duplicated);
+**(2)** skip chains whose legs differ in `QUANTITY_UNIT`/`PRICE_UNIT`/`QUANTITY_FREQ`
+(recorded in `_unresolved`); **(3)** GAS vs LNG only by `DEAL_TYPE`.
+
+Output: `reference_date, weekday, deal_type, product, periodicity_2, tenor_near,
+tenor_far, vwap, total_volume, trade_count` (`build_spreads()` also exposes
+`spread_kind` = `time`/`location` and the `tenor2_*` variants).
+
+**Open items (need real data to finalise):** the volume convention for
+unequal-size legs; multi-leg option spreads (>2 legs); the third spread type.
+
+---
+
+## 6. Spreads, tenors & the forward curve (concepts)
+
+This section captures *why* a spread does not fit the outright `(product, tenor)`
+model, and how the two relate when building a forward curve.
+
+### 6.1 An outright is a point; a time spread is a slope
+
+- An **outright** is a single point of the forward curve:
+  `(product, tenor) → price` — e.g. `(TTF, M+1) = 31.00`.
+- A **time / calendar spread** is **not** a single point. It is the **difference
+  between two delivery periods of the same product**, so it carries **two
+  tenors** — a near (front) leg and a far (back) leg. A single tenor cannot
+  describe it; that is the conceptual mismatch.
+
+| | Outright | Time spread | Location spread |
+|---|---|---|---|
+| Meaning | absolute level at one period | slope between two periods (same product) | basis between two products (same period) |
+| Tenor(s) | **one** (`M+1`) | **two** (`near=M+1`, `far=M+2`) | one period, **two products** |
+| Natural key | `(product, tenor)` | `(product, tenor_near, tenor_far)` | `(product_near, product_far, tenor)` |
+| Price | forward price | differential (can be negative) | differential (can be negative) |
+
+So a time spread should be keyed by **`(product, tenor_near, tenor_far)`**, not by
+a single tenor — otherwise `Dec25/Jan26` and `Q4/Q1` would collapse onto the same
+`(TTF, …)` row and the VWAP would mix unrelated spreads.
+
+### 6.2 Sign convention — `near − far`, *not* `buy − sell`
+
+For a spread VWAP to be meaningful the sign must follow a **fixed convention**:
+
+- **Time spread:** `price(near) − price(far)` (front − back).
+- **Location spread:** a fixed product order (e.g. `TTF − NBP`).
+
+It must **not** use the firm's buy/sell perspective. The same market spread
+executed in opposite directions by two firms would otherwise carry opposite signs
+and **cancel out in the VWAP**:
+
+```
+Firm A buys M+1 / sells M+2  → executes  M+1 − M+2 = −0.46
+Firm B buys M+2 / sells M+1  → executes  M+2 − M+1 = +0.46   (same market spread!)
+buy−sell VWAP → ≈ 0   (wrong)
+near−far VWAP → −0.46 (correct)
+```
+
+Because **both leg prices are present in the data**, the differential is computed
+directly as `price(near) − price(far)`; `BUYER_GCD_ID` / `SELLER_GCD_ID` are then
+only needed to **confirm leg pairing within the chain**, not to set the sign.
+
+### 6.3 Building a forward curve (bootstrapping)
+
+Spreads alone give only the **shape** (slope) of the curve, never the absolute
+level. A forward curve is reconstructed by combining **anchor outrights** (front
+month, Cal, season) with **spreads**, propagating from a known point:
+
+```
+price(far) = price(near) − spread(near, far)
+
+Anchor (GasOutrightEngine):  TTF M+1 = 31.00
+Spreads (GasSpreadEngine):   M+1/M+2 = −0.46 ,  M+2/M+3 = −0.30
+Bootstrap:
+  M+2 = 31.00 − (−0.46) = 31.46
+  M+3 = 31.46 − (−0.30) = 31.76
+→ Forward curve: M+1 = 31.00, M+2 = 31.46, M+3 = 31.76
+```
+
+This is why the two engines are complementary: **`GasOutrightEngine` provides the
+anchors/levels, `GasSpreadEngine` provides the increments**, and a curve builder
+joins them on the tenor axis. (A dedicated bootstrapper is a possible future
+component; today the two VWAP outputs are produced and can be combined downstream.)
+
+---
+
+## 7. Usage
+
+```python
+import pandas as pd
+from periodicity_tenor_generation import GasTenorProcessor
+from outright_vwap_engine import GasOutrightEngine
+from spread_vwap_engine import GasSpreadEngine
+
+# 1) Tenor generation (per region with its seasonal_type)
+tp = GasTenorProcessor(pd.read_csv("NG_trades_EMEA_SORT.csv"), seasonal_type="ROW")
+tp.run()                                        # df_trades + periodicity_2 / tenor / tenor2
+
+# 2) Outright VWAP — on demand
+#    (optional per-granularity window: only count Daily deals between 08:00-17:00)
+eng = GasOutrightEngine.from_tenor(tp, vwap_filters={"Daily": {"hours": ("08:00", "17:00")}})
+v1       = eng.vwap("tenor1")                                     # Custom merged
+v2       = eng.vwap("tenor2")                                     # Custom -> TERM_DESCRIPTION
+linear   = eng.vwap("tenor1", instruments=["Future", "Spot Fwd"], deal_types=["GAS"])
+combined = eng.vwap("tenor1", combine_deal_types=True)           # GAS + LNG pooled in one row
+opts     = eng.vwap_options("tenor1")                            # option premiums, on their own
+
+# 3) Spread VWAP — independent
+sp = GasSpreadEngine.from_tenor(tp, own_gcd=MY_GCD_ID)
+spread_vwap = sp.vwap("tenor1")                                  # linear spreads (Future/Spot Fwd)
+opt_spreads = sp.vwap_options("tenor1")                          # option spreads
+```
+
+---
+
+## 8. Files
+
+| File | Purpose |
+|---|---|
+| `periodicity_tenor_generation.py` | `GasTenorProcessor` — tenor & periodicity generation. |
+| `outright_vwap_engine.py` | `GasOutrightEngine` — Outright VWAP. |
+| `spread_vwap_engine.py` | `GasSpreadEngine` — Spread VWAP. |
+| `periodicity_2_processor.py` | `Periodicity2Processor` — periodicity audit. |
+| `README.md` | **This file** — engines (Outright + Spread) & data structure. |
+| `README_TENOR.md` | Stage 1 tenor generation (`GasTenorProcessor`) in detail. |
